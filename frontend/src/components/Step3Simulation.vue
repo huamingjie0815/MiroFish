@@ -311,6 +311,7 @@ const props = defineProps({
 const emit = defineEmits(['go-back', 'next-step', 'add-log', 'update-status'])
 
 const router = useRouter()
+const RUN_INTENT_STORAGE_PREFIX = 'mirofish:simulation-run-intent:'
 
 // State
 const isGeneratingReport = ref(false)
@@ -360,6 +361,93 @@ const redditElapsedTime = computed(() => {
 // Methods
 const addLog = (msg) => {
   emit('add-log', msg)
+}
+
+const getRunIntentKey = () => `${RUN_INTENT_STORAGE_PREFIX}${props.simulationId}`
+
+const consumeRunIntent = () => {
+  if (typeof window === 'undefined' || !props.simulationId) return null
+  const intentKey = getRunIntentKey()
+  const rawIntent = window.sessionStorage.getItem(intentKey)
+  if (!rawIntent) return null
+
+  window.sessionStorage.removeItem(intentKey)
+
+  try {
+    return JSON.parse(rawIntent)
+  } catch {
+    return { requestedAt: Date.now(), maxRounds: null }
+  }
+}
+
+const hasExistingRun = (data = {}) => {
+  if (!data) return false
+  if (data.runner_status && data.runner_status !== 'idle') return true
+
+  return [
+    data.total_rounds,
+    data.current_round,
+    data.twitter_current_round,
+    data.reddit_current_round,
+    data.total_actions_count,
+    data.twitter_actions_count,
+    data.reddit_actions_count
+  ].some(value => Number(value) > 0) || data.twitter_running || data.reddit_running || data.twitter_completed || data.reddit_completed
+}
+
+const isRunActive = (data = {}) => {
+  return ['starting', 'running', 'stopping'].includes(data?.runner_status) || data?.twitter_running || data?.reddit_running
+}
+
+const syncActionsFromServer = (serverActions = []) => {
+  let newActionsAdded = 0
+
+  serverActions.forEach(action => {
+    const actionId = action.id || `${action.timestamp}-${action.platform}-${action.agent_id}-${action.action_type}`
+
+    if (!actionIds.value.has(actionId)) {
+      actionIds.value.add(actionId)
+      allActions.value.push({
+        ...action,
+        _uniqueId: actionId
+      })
+      newActionsAdded++
+    }
+  })
+
+  return newActionsAdded
+}
+
+const replaceAllActions = (serverActions = []) => {
+  actionIds.value = new Set()
+  allActions.value = []
+  syncActionsFromServer(serverActions)
+}
+
+const applyRunSnapshot = (data = {}) => {
+  runStatus.value = data || {}
+  prevTwitterRound.value = data.twitter_current_round || 0
+  prevRedditRound.value = data.reddit_current_round || 0
+
+  if (data.runner_status === 'failed') {
+    phase.value = 2
+    emit('update-status', 'error')
+    return
+  }
+
+  if (isRunActive(data)) {
+    phase.value = 1
+    emit('update-status', 'processing')
+    return
+  }
+
+  if (checkPlatformsCompleted(data) || ['completed', 'stopped'].includes(data.runner_status)) {
+    phase.value = 2
+    emit('update-status', 'completed')
+    return
+  }
+
+  phase.value = 0
 }
 
 // 重置所有状态（用于重新启动模拟）
@@ -417,9 +505,14 @@ const doStartSimulation = async () => {
       
       phase.value = 1
       runStatus.value = res.data
-      
-      startStatusPolling()
-      startDetailPolling()
+
+      await fetchRunStatusDetail()
+      await fetchRunStatus()
+
+      if (phase.value === 1) {
+        startDetailPolling()
+        startStatusPolling()
+      }
     } else {
       startError.value = res.error || '启动失败'
       addLog(`✗ 启动失败: ${res.error || '未知错误'}`)
@@ -464,10 +557,12 @@ let statusTimer = null
 let detailTimer = null
 
 const startStatusPolling = () => {
+  if (statusTimer) clearInterval(statusTimer)
   statusTimer = setInterval(fetchRunStatus, 2000)
 }
 
 const startDetailPolling = () => {
+  if (detailTimer) clearInterval(detailTimer)
   detailTimer = setInterval(fetchRunStatusDetail, 3000)
 }
 
@@ -515,10 +610,11 @@ const fetchRunStatus = async () => {
       // 通过检测 twitter_completed 和 reddit_completed 状态判断
       const platformsCompleted = checkPlatformsCompleted(data)
       
-      if (isCompleted || platformsCompleted) {
+      if ((isCompleted || platformsCompleted) && phase.value !== 2) {
         if (platformsCompleted && !isCompleted) {
           addLog('✓ 检测到所有平台模拟已结束')
         }
+        await fetchRunStatusDetail()
         addLog('✓ 模拟已完成')
         phase.value = 2
         stopPolling()
@@ -563,28 +659,51 @@ const fetchRunStatusDetail = async () => {
     if (res.success && res.data) {
       // 使用 all_actions 获取完整的动作列表
       const serverActions = res.data.all_actions || []
-      
-      // 增量添加新动作（去重）
-      let newActionsAdded = 0
-      serverActions.forEach(action => {
-        // 生成唯一ID
-        const actionId = action.id || `${action.timestamp}-${action.platform}-${action.agent_id}-${action.action_type}`
-        
-        if (!actionIds.value.has(actionId)) {
-          actionIds.value.add(actionId)
-          allActions.value.push({
-            ...action,
-            _uniqueId: actionId
-          })
-          newActionsAdded++
-        }
-      })
+      syncActionsFromServer(serverActions)
       
       // 不自动滚动，让用户自由查看时间轴
       // 新动作会在底部追加
     }
   } catch (err) {
     console.warn('获取详细状态失败:', err)
+  }
+}
+
+const restoreSimulationState = async () => {
+  if (!props.simulationId) return false
+
+  try {
+    const [statusRes, detailRes] = await Promise.all([
+      getRunStatus(props.simulationId),
+      getRunStatusDetail(props.simulationId)
+    ])
+
+    const snapshot = detailRes.success && detailRes.data
+      ? detailRes.data
+      : (statusRes.success ? statusRes.data : null)
+
+    if (!hasExistingRun(snapshot)) {
+      return false
+    }
+
+    if (detailRes.success && detailRes.data) {
+      replaceAllActions(detailRes.data.all_actions || [])
+    }
+
+    applyRunSnapshot(snapshot)
+
+    if (isRunActive(snapshot)) {
+      addLog('已恢复运行中的模拟现场')
+      startDetailPolling()
+      startStatusPolling()
+    } else {
+      addLog('已恢复模拟结果')
+    }
+
+    return true
+  } catch (err) {
+    addLog(`恢复模拟现场失败: ${err.message}`)
+    return false
   }
 }
 
@@ -684,10 +803,26 @@ watch(() => props.systemLogs?.length, () => {
   })
 })
 
-onMounted(() => {
+onMounted(async () => {
   addLog('Step3 模拟运行初始化')
-  if (props.simulationId) {
-    doStartSimulation()
+  if (!props.simulationId) {
+    return
+  }
+
+  const runIntent = consumeRunIntent()
+
+  if (runIntent) {
+    if (runIntent.maxRounds) {
+      addLog(`检测到新的模拟启动请求: ${runIntent.maxRounds} 轮`)
+    }
+    await doStartSimulation()
+    return
+  }
+
+  const restored = await restoreSimulationState()
+  if (!restored) {
+    addLog('未发现可恢复的模拟记录，开始新的模拟...')
+    await doStartSimulation()
   }
 })
 

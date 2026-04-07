@@ -135,15 +135,16 @@ class SimulationManager:
         # 内存中的模拟状态缓存
         self._simulations: Dict[str, SimulationState] = {}
     
-    def _get_simulation_dir(self, simulation_id: str) -> str:
+    def _get_simulation_dir(self, simulation_id: str, create: bool = False) -> str:
         """获取模拟数据目录"""
         sim_dir = os.path.join(self.SIMULATION_DATA_DIR, simulation_id)
-        os.makedirs(sim_dir, exist_ok=True)
+        if create:
+            os.makedirs(sim_dir, exist_ok=True)
         return sim_dir
     
     def _save_simulation_state(self, state: SimulationState):
         """保存模拟状态到文件"""
-        sim_dir = self._get_simulation_dir(state.simulation_id)
+        sim_dir = self._get_simulation_dir(state.simulation_id, create=True)
         state_file = os.path.join(sim_dir, "state.json")
         
         state.updated_at = datetime.now().isoformat()
@@ -266,7 +267,7 @@ class SimulationManager:
             state.status = SimulationStatus.PREPARING
             self._save_simulation_state(state)
             
-            sim_dir = self._get_simulation_dir(simulation_id)
+            sim_dir = self._get_simulation_dir(simulation_id, create=True)
             
             # ========== 阶段1: 读取并过滤实体 ==========
             if progress_callback:
