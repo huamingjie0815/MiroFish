@@ -405,6 +405,7 @@ class SimulationRunner:
         cls._action_queues[simulation_id] = action_queue
         
         # 启动模拟进程
+        main_log_file = None
         try:
             # 构建运行命令，使用完整路径
             # 新的日志结构：
@@ -467,6 +468,12 @@ class SimulationRunner:
             logger.info(f"模拟启动成功: {simulation_id}, pid={process.pid}, platform={platform}")
             
         except Exception as e:
+            # 关闭日志文件句柄，防止泄漏
+            if main_log_file is not None and simulation_id not in cls._stdout_files:
+                try:
+                    main_log_file.close()
+                except Exception:
+                    pass
             state.runner_status = RunnerStatus.FAILED
             state.error = str(e)
             cls._save_run_state(state)
@@ -518,24 +525,37 @@ class SimulationRunner:
             
             # 进程结束
             exit_code = process.returncode
+
+            # 检查此监控线程是否仍为活跃的监控线程。
+            # stop_simulation + 强制重启的场景下：旧进程被 SIGKILL 后旧监控线程才感知到退出，
+            # 但此时 cls._processes[simulation_id] 已经指向新进程。
+            # 若发生替换，跳过错误日志和资源清理，避免误停新模拟的资源。
+            is_active_monitor = cls._processes.get(simulation_id) is process
             
             if exit_code == 0:
                 state.runner_status = RunnerStatus.COMPLETED
                 state.completed_at = datetime.now().isoformat()
                 logger.info(f"模拟完成: {simulation_id}")
             else:
-                state.runner_status = RunnerStatus.FAILED
-                # 从主日志文件读取错误信息
-                main_log_path = os.path.join(sim_dir, "simulation.log")
-                error_info = ""
-                try:
-                    if os.path.exists(main_log_path):
-                        with open(main_log_path, 'r', encoding='utf-8') as f:
-                            error_info = f.read()[-2000:]  # 取最后2000字符
-                except Exception:
-                    pass
-                state.error = f"进程退出码: {exit_code}, 错误: {error_info}"
-                logger.error(f"模拟失败: {simulation_id}, error={state.error}")
+                if is_active_monitor:
+                    state.runner_status = RunnerStatus.FAILED
+                    # 从主日志文件读取错误信息
+                    main_log_path = os.path.join(sim_dir, "simulation.log")
+                    error_info = ""
+                    try:
+                        if os.path.exists(main_log_path):
+                            with open(main_log_path, 'r', encoding='utf-8') as f:
+                                error_info = f.read()[-2000:]  # 取最后2000字符
+                    except Exception:
+                        pass
+                    state.error = f"进程退出码: {exit_code}, 错误: {error_info}"
+                    logger.error(f"模拟失败: {simulation_id}, error={state.error}")
+                else:
+                    # 旧监控线程感知到被主动 kill（exit_code < 0）的旧进程退出，属于正常流程。
+                    logger.info(
+                        f"旧监控线程检测到进程退出（已被强制重启替换），退出码={exit_code}: {simulation_id}"
+                    )
+                    return  # 直接返回，finally 中的资源清理只处理自己的文件句柄
             
             state.twitter_running = False
             state.reddit_running = False
@@ -548,33 +568,42 @@ class SimulationRunner:
             cls._save_run_state(state)
         
         finally:
-            # 停止图谱记忆更新器
-            if cls._graph_memory_enabled.get(simulation_id, False):
-                try:
-                    ZepGraphMemoryManager.stop_updater(simulation_id)
-                    logger.info(f"已停止图谱记忆更新: simulation_id={simulation_id}")
-                except Exception as e:
-                    logger.error(f"停止图谱记忆更新器失败: {e}")
-                cls._graph_memory_enabled.pop(simulation_id, None)
-            
-            # 清理进程资源
-            cls._processes.pop(simulation_id, None)
-            cls._action_queues.pop(simulation_id, None)
-            
-            # 关闭日志文件句柄
-            if simulation_id in cls._stdout_files:
-                try:
-                    cls._stdout_files[simulation_id].close()
-                except Exception:
-                    pass
-                cls._stdout_files.pop(simulation_id, None)
-            if simulation_id in cls._stderr_files and cls._stderr_files[simulation_id]:
-                try:
-                    cls._stderr_files[simulation_id].close()
-                except Exception:
-                    pass
-                cls._stderr_files.pop(simulation_id, None)
-    
+            # 仅当此监控线程仍是当前活跃的监控线程时，才清理共享的类级别资源。
+            # 如果模拟已被强制重启（新进程已覆盖 cls._processes[simulation_id]），
+            # 则跳过图谱更新器和进程引用的清理，避免影响新模拟。
+            is_active_monitor = cls._processes.get(simulation_id) is process
+
+            if is_active_monitor:
+                # 停止图谱记忆更新器
+                if cls._graph_memory_enabled.get(simulation_id, False):
+                    try:
+                        ZepGraphMemoryManager.stop_updater(simulation_id)
+                        logger.info(f"已停止图谱记忆更新: simulation_id={simulation_id}")
+                    except Exception as e:
+                        logger.error(f"停止图谱记忆更新器失败: {e}")
+                    cls._graph_memory_enabled.pop(simulation_id, None)
+                
+                # 清理进程资源
+                cls._processes.pop(simulation_id, None)
+                cls._action_queues.pop(simulation_id, None)
+                
+                # 关闭日志文件句柄
+                if simulation_id in cls._stdout_files:
+                    try:
+                        cls._stdout_files[simulation_id].close()
+                    except Exception:
+                        pass
+                    cls._stdout_files.pop(simulation_id, None)
+                if simulation_id in cls._stderr_files and cls._stderr_files[simulation_id]:
+                    try:
+                        cls._stderr_files[simulation_id].close()
+                    except Exception:
+                        pass
+                    cls._stderr_files.pop(simulation_id, None)
+            else:
+                # 旧监控线程：模拟已被强制重启，不清理属于新模拟的共享资源。
+                logger.debug(f"旧监控线程退出，跳过共享资源清理: {simulation_id}")
+
     @classmethod
     def _read_action_log(
         cls, 
@@ -1489,7 +1518,7 @@ class SimulationRunner:
         simulation_id: str,
         interviews: List[Dict[str, Any]],
         platform: str = None,
-        timeout: float = 120.0
+        timeout: float = 180.0
     ) -> Dict[str, Any]:
         """
         批量采访多个Agent

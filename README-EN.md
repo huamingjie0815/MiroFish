@@ -176,6 +176,62 @@ Reads `.env` from root directory by default, maps ports `3000 (frontend) / 5001 
 
 > Mirror address for faster pulling is provided as comments in `docker-compose.yml`, replace if needed.
 
+### 3. Local Docker (no local Node/Python required)
+
+Use this when you want to run MiroFish on any machine without installing local dependencies. The container will clone the repo and install dependencies on first boot.
+
+Prerequisites:
+
+- Docker & Docker Compose
+- Network access to GitHub (container clones code)
+
+1) Configure env for local docker
+
+```bash
+cp .env.example .env.local
+# edit .env.local and fill required API keys (same variables as source deployment)
+```
+
+2) Build image
+
+```bash
+docker-compose -f docker-compose.local.yml build
+```
+
+3) Start services
+
+```bash
+docker-compose -f docker-compose.local.yml up
+```
+
+On first start the container will:
+1. `git clone` the latest code into the container
+2. run `npm run setup:all` to install all dependencies
+3. start frontend and backend
+
+On subsequent starts (code already exists) the container will do `git pull` automatically and skip re-cloning.
+
+Rebuild image when dependencies change:
+
+```bash
+docker-compose -f docker-compose.local.yml build --no-cache
+```
+
+Stop and remove volumes:
+
+```bash
+# stop
+docker-compose -f docker-compose.local.yml down
+
+# stop and remove volumes (next start will re-clone)
+docker-compose -f docker-compose.local.yml down -v
+```
+
+Service URLs:
+- Frontend: `http://localhost:3000`
+- Backend API: `http://localhost:5001`
+- Neo4j Browser: `http://localhost:7474` (user/password: `neo4j/neo4j123456`)
+
 ## 📬 Join the Conversation
 
 <div align="center">

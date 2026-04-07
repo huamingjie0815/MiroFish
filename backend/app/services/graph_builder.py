@@ -1,6 +1,7 @@
 """
 图谱构建服务
-接口2：使用Zep API构建Standalone Graph
+接口2：使用知识图谱API构建图谱
+支持 Zep Cloud 和 Graphiti (本地) 两种模式
 """
 
 import os
@@ -10,13 +11,18 @@ import threading
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass
 
-from zep_cloud.client import Zep
-from zep_cloud import EpisodeData, EntityEdgeSourceTarget
-
 from ..config import Config
 from ..models.task import TaskManager, TaskStatus
-from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
+from .kg_adapter import get_knowledge_graph_adapter
 from .text_processor import TextProcessor
+
+# 保留原有的导入，用于动态类生成（兼容模式）
+try:
+    from zep_cloud import EpisodeData, EntityEdgeSourceTarget
+    from zep_cloud.external_clients.ontology import EntityModel, EntityText, EdgeModel
+    ZEP_CLOUD_AVAILABLE = True
+except ImportError:
+    ZEP_CLOUD_AVAILABLE = False
 
 
 @dataclass
@@ -39,15 +45,14 @@ class GraphInfo:
 class GraphBuilderService:
     """
     图谱构建服务
-    负责调用Zep API构建知识图谱
+    负责调用知识图谱 API 构建图谱
+    支持 Zep Cloud 和 Graphiti 两种模式
     """
-    
+
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = Zep(api_key=self.api_key)
+        self.api_key = api_key  # 保留参数兼容性
+        # 使用适配器
+        self.kg = get_knowledge_graph_adapter()
         self.task_manager = TaskManager()
     
     def build_graph_async(
@@ -185,15 +190,14 @@ class GraphBuilderService:
             self.task_manager.fail_task(task_id, error_msg)
     
     def create_graph(self, name: str) -> str:
-        """创建Zep图谱（公开方法）"""
+        """创建图谱（公开方法）"""
         graph_id = f"mirofish_{uuid.uuid4().hex[:16]}"
-        
-        self.client.graph.create(
+
+        self.kg.create_graph(
             graph_id=graph_id,
             name=name,
-            description="MiroFish Social Simulation Graph"
         )
-        
+
         return graph_id
     
     def set_ontology(self, graph_id: str, ontology: Dict[str, Any]):
@@ -277,13 +281,14 @@ class GraphBuilderService:
             if source_targets:
                 edge_definitions[name] = (edge_class, source_targets)
         
-        # 调用Zep API设置本体
+        # 调用图谱API设置本体
         if entity_types or edge_definitions:
-            self.client.graph.set_ontology(
-                graph_ids=[graph_id],
-                entities=entity_types if entity_types else None,
-                edges=edge_definitions if edge_definitions else None,
-            )
+            # 封装为 ontology 格式
+            ontology = {
+                "entities": entity_types if entity_types else None,
+                "edges": edge_definitions if edge_definitions else None,
+            }
+            self.kg.set_ontology(graph_id, ontology)
     
     def add_text_batches(
         self,
@@ -293,49 +298,59 @@ class GraphBuilderService:
         progress_callback: Optional[Callable] = None
     ) -> List[str]:
         """分批添加文本到图谱，返回所有 episode 的 uuid 列表"""
+        import logging
+        build_logger = logging.getLogger('mirofish.build')
+
         episode_uuids = []
         total_chunks = len(chunks)
-        
+
+        build_logger.debug(f"[add_text_batches] 开始添加 {total_chunks} 个块，batch_size={batch_size}")
+
         for i in range(0, total_chunks, batch_size):
             batch_chunks = chunks[i:i + batch_size]
             batch_num = i // batch_size + 1
             total_batches = (total_chunks + batch_size - 1) // batch_size
-            
+
             if progress_callback:
                 progress = (i + len(batch_chunks)) / total_chunks
                 progress_callback(
                     f"发送第 {batch_num}/{total_batches} 批数据 ({len(batch_chunks)} 块)...",
                     progress
                 )
-            
-            # 构建episode数据
-            episodes = [
-                EpisodeData(data=chunk, type="text")
-                for chunk in batch_chunks
-            ]
-            
-            # 发送到Zep
+
+            build_logger.debug(f"[add_text_batches] 准备发送批次 {batch_num}/{total_batches}")
+
+            # 发送到图谱
             try:
-                batch_result = self.client.graph.add_batch(
+                # 使用适配器的批量添加方法
+                build_logger.debug(f"[add_text_batches] 调用 kg.add_episodes_batch...")
+                batch_result = self.kg.add_episodes_batch(
                     graph_id=graph_id,
-                    episodes=episodes
+                    texts=batch_chunks
                 )
-                
-                # 收集返回的 episode uuid
+                build_logger.debug(f"[add_text_batches] 批次 {batch_num} 发送完成")
+
+                # 收集返回的 episode uuid（兼容 dict 和对象两种格式）
                 if batch_result and isinstance(batch_result, list):
                     for ep in batch_result:
-                        ep_uuid = getattr(ep, 'uuid_', None) or getattr(ep, 'uuid', None)
+                        if isinstance(ep, dict):
+                            ep_uuid = ep.get('uuid') or ep.get('uuid_')
+                        else:
+                            ep_uuid = getattr(ep, 'uuid_', None) or getattr(ep, 'uuid', None)
                         if ep_uuid:
                             episode_uuids.append(ep_uuid)
-                
+                            build_logger.debug(f"[add_text_batches] 收集到 episode uuid: {ep_uuid}")
+
                 # 避免请求过快
                 time.sleep(1)
-                
+
             except Exception as e:
+                build_logger.error(f"[add_text_batches] 批次 {batch_num} 发送失败: {str(e)}")
                 if progress_callback:
                     progress_callback(f"批次 {batch_num} 发送失败: {str(e)}", 0)
                 raise
-        
+
+        build_logger.debug(f"[add_text_batches] 所有批次发送完成，共 {len(episode_uuids)} 个 episode")
         return episode_uuids
     
     def _wait_for_episodes(
@@ -370,13 +385,17 @@ class GraphBuilderService:
             # 检查每个 episode 的处理状态
             for ep_uuid in list(pending_episodes):
                 try:
-                    episode = self.client.graph.episode.get(uuid_=ep_uuid)
-                    is_processed = getattr(episode, 'processed', False)
-                    
+                    episode = self.kg.get_episode(ep_uuid)
+                    # 兼容 dict 和对象两种格式
+                    if isinstance(episode, dict):
+                        is_processed = episode.get('processed', False)
+                    else:
+                        is_processed = getattr(episode, 'processed', False)
+
                     if is_processed:
                         pending_episodes.remove(ep_uuid)
                         completed_count += 1
-                        
+
                 except Exception as e:
                     # 忽略单个查询错误，继续
                     pass
@@ -396,17 +415,18 @@ class GraphBuilderService:
     
     def _get_graph_info(self, graph_id: str) -> GraphInfo:
         """获取图谱信息"""
-        # 获取节点（分页）
-        nodes = fetch_all_nodes(self.client, graph_id)
+        # 获取节点（使用适配器）
+        nodes = self.kg.get_nodes(graph_id, limit=2000)
 
-        # 获取边（分页）
-        edges = fetch_all_edges(self.client, graph_id)
+        # 获取边（使用适配器）
+        edges = self.kg.get_edges(graph_id, limit=2000)
 
         # 统计实体类型
         entity_types = set()
         for node in nodes:
-            if node.labels:
-                for label in node.labels:
+            labels = node.labels if hasattr(node, 'labels') else node.get('labels', [])
+            if labels:
+                for label in labels:
                     if label not in ["Entity", "Node"]:
                         entity_types.add(label)
 
@@ -420,72 +440,113 @@ class GraphBuilderService:
     def get_graph_data(self, graph_id: str) -> Dict[str, Any]:
         """
         获取完整图谱数据（包含详细信息）
-        
+
         Args:
             graph_id: 图谱ID
-            
+
         Returns:
             包含nodes和edges的字典，包括时间信息、属性等详细数据
         """
-        nodes = fetch_all_nodes(self.client, graph_id)
-        edges = fetch_all_edges(self.client, graph_id)
+        # 使用适配器获取节点和边
+        nodes = self.kg.get_nodes(graph_id, limit=2000)
+        edges = self.kg.get_edges(graph_id, limit=2000)
 
-        # 创建节点映射用于获取节点名称
+        # 创建节点映射用于获取节点名称（兼容对象和字典两种格式）
         node_map = {}
         for node in nodes:
-            node_map[node.uuid_] = node.name or ""
-        
+            if isinstance(node, dict):
+                node_map[node.get('uuid_', '')] = node.get('name', '') or ""
+            else:
+                node_map[getattr(node, 'uuid_', '')] = getattr(node, 'name', '') or ""
+
         nodes_data = []
         for node in nodes:
-            # 获取创建时间
-            created_at = getattr(node, 'created_at', None)
-            if created_at:
-                created_at = str(created_at)
-            
-            nodes_data.append({
-                "uuid": node.uuid_,
-                "name": node.name,
-                "labels": node.labels or [],
-                "summary": node.summary or "",
-                "attributes": node.attributes or {},
-                "created_at": created_at,
-            })
-        
+            # 兼容对象和字典两种格式
+            if isinstance(node, dict):
+                created_at = node.get('created_at')
+                if created_at:
+                    created_at = str(created_at)
+                nodes_data.append({
+                    "uuid": node.get('uuid_', ''),
+                    "name": node.get('name', ''),
+                    "labels": node.get('labels', []),
+                    "summary": node.get('summary', ''),
+                    "attributes": node.get('attributes', {}),
+                    "created_at": created_at,
+                })
+            else:
+                created_at = getattr(node, 'created_at', None)
+                if created_at:
+                    created_at = str(created_at)
+                nodes_data.append({
+                    "uuid": getattr(node, 'uuid_', ''),
+                    "name": getattr(node, 'name', ''),
+                    "labels": getattr(node, 'labels', []),
+                    "summary": getattr(node, 'summary', ''),
+                    "attributes": getattr(node, 'attributes', {}),
+                    "created_at": created_at,
+                })
+
         edges_data = []
         for edge in edges:
-            # 获取时间信息
-            created_at = getattr(edge, 'created_at', None)
-            valid_at = getattr(edge, 'valid_at', None)
-            invalid_at = getattr(edge, 'invalid_at', None)
-            expired_at = getattr(edge, 'expired_at', None)
-            
-            # 获取 episodes
-            episodes = getattr(edge, 'episodes', None) or getattr(edge, 'episode_ids', None)
-            if episodes and not isinstance(episodes, list):
-                episodes = [str(episodes)]
-            elif episodes:
-                episodes = [str(e) for e in episodes]
-            
-            # 获取 fact_type
-            fact_type = getattr(edge, 'fact_type', None) or edge.name or ""
-            
-            edges_data.append({
-                "uuid": edge.uuid_,
-                "name": edge.name or "",
-                "fact": edge.fact or "",
-                "fact_type": fact_type,
-                "source_node_uuid": edge.source_node_uuid,
-                "target_node_uuid": edge.target_node_uuid,
-                "source_node_name": node_map.get(edge.source_node_uuid, ""),
-                "target_node_name": node_map.get(edge.target_node_uuid, ""),
-                "attributes": edge.attributes or {},
-                "created_at": str(created_at) if created_at else None,
-                "valid_at": str(valid_at) if valid_at else None,
-                "invalid_at": str(invalid_at) if invalid_at else None,
-                "expired_at": str(expired_at) if expired_at else None,
-                "episodes": episodes or [],
-            })
-        
+            # 兼容对象和字典两种格式
+            if isinstance(edge, dict):
+                created_at = edge.get('created_at')
+                valid_at = edge.get('valid_at')
+                invalid_at = edge.get('invalid_at')
+                expired_at = edge.get('expired_at')
+                episodes = edge.get('episodes', [])
+                fact_type = edge.get('fact_type', '') or edge.get('name', '')
+                edges_data.append({
+                    "uuid": edge.get('uuid_', ''),
+                    "name": edge.get('name', ''),
+                    "fact": edge.get('fact', ''),
+                    "fact_type": fact_type,
+                    "source_node_uuid": edge.get('source_node_uuid', ''),
+                    "target_node_uuid": edge.get('target_node_uuid', ''),
+                    "source_node_name": node_map.get(edge.get('source_node_uuid', ''), ''),
+                    "target_node_name": node_map.get(edge.get('target_node_uuid', ''), ''),
+                    "attributes": edge.get('attributes', {}),
+                    "created_at": str(created_at) if created_at else None,
+                    "valid_at": str(valid_at) if valid_at else None,
+                    "invalid_at": str(invalid_at) if invalid_at else None,
+                    "expired_at": str(expired_at) if expired_at else None,
+                    "episodes": episodes if isinstance(episodes, list) else [],
+                })
+            else:
+                # 获取时间信息
+                created_at = getattr(edge, 'created_at', None)
+                valid_at = getattr(edge, 'valid_at', None)
+                invalid_at = getattr(edge, 'invalid_at', None)
+                expired_at = getattr(edge, 'expired_at', None)
+
+                # 获取 episodes
+                episodes = getattr(edge, 'episodes', None) or getattr(edge, 'episode_ids', None)
+                if episodes and not isinstance(episodes, list):
+                    episodes = [str(episodes)]
+                elif episodes:
+                    episodes = [str(e) for e in episodes]
+
+                # 获取 fact_type
+                fact_type = getattr(edge, 'fact_type', None) or getattr(edge, 'name', '') or ""
+
+                edges_data.append({
+                    "uuid": getattr(edge, 'uuid_', ''),
+                    "name": getattr(edge, 'name', ''),
+                    "fact": getattr(edge, 'fact', ''),
+                    "fact_type": fact_type,
+                    "source_node_uuid": getattr(edge, 'source_node_uuid', ''),
+                    "target_node_uuid": getattr(edge, 'target_node_uuid', ''),
+                    "source_node_name": node_map.get(getattr(edge, 'source_node_uuid', ''), ''),
+                    "target_node_name": node_map.get(getattr(edge, 'target_node_uuid', ''), ''),
+                    "attributes": getattr(edge, 'attributes', {}),
+                    "created_at": str(created_at) if created_at else None,
+                    "valid_at": str(valid_at) if valid_at else None,
+                    "invalid_at": str(invalid_at) if invalid_at else None,
+                    "expired_at": str(expired_at) if expired_at else None,
+                    "episodes": episodes or [],
+                })
+
         return {
             "graph_id": graph_id,
             "nodes": nodes_data,
@@ -496,5 +557,5 @@ class GraphBuilderService:
     
     def delete_graph(self, graph_id: str):
         """删除图谱"""
-        self.client.graph.delete(graph_id=graph_id)
+        self.kg.delete(graph_id=graph_id)
 

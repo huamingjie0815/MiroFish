@@ -195,13 +195,13 @@ class SimulationIPCClient:
     ) -> IPCResponse:
         """
         发送单个Agent采访命令
-        
+
         Args:
             agent_id: Agent ID
             prompt: 采访问题
             platform: 指定平台（可选）
                 - "twitter": 只采访Twitter平台
-                - "reddit": 只采访Reddit平台  
+                - "reddit": 只采访Reddit平台
                 - None: 双平台模拟时同时采访两个平台，单平台模拟时采访该平台
             timeout: 超时时间
             

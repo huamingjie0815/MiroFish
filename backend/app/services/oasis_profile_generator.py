@@ -1,9 +1,10 @@
 """
 OASIS Agent Profile生成器
-将Zep图谱中的实体转换为OASIS模拟平台所需的Agent Profile格式
+将图谱中的实体转换为OASIS模拟平台所需的Agent Profile格式
+支持 Zep Cloud 和 Graphiti 两种模式
 
 优化改进：
-1. 调用Zep检索功能二次丰富节点信息
+1. 调用图谱检索功能二次丰富节点信息
 2. 优化提示词生成非常详细的人设
 3. 区分个人实体和抽象群体实体
 """
@@ -16,11 +17,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from openai import OpenAI
-from zep_cloud.client import Zep
 
 from ..config import Config
 from ..utils.logger import get_logger
 from .zep_entity_reader import EntityNode, ZepEntityReader
+from .kg_adapter import get_knowledge_graph_adapter
 
 logger = get_logger('mirofish.oasis_profile')
 
@@ -196,17 +197,15 @@ class OasisProfileGenerator:
             api_key=self.api_key,
             base_url=self.base_url
         )
-        
-        # Zep客户端用于检索丰富上下文
-        self.zep_api_key = zep_api_key or Config.ZEP_API_KEY
-        self.zep_client = None
+
+        # 图谱客户端用于检索丰富上下文
         self.graph_id = graph_id
-        
-        if self.zep_api_key:
-            try:
-                self.zep_client = Zep(api_key=self.zep_api_key)
-            except Exception as e:
-                logger.warning(f"Zep客户端初始化失败: {e}")
+        # 使用适配器
+        try:
+            self.kg = get_knowledge_graph_adapter()
+        except Exception as e:
+            logger.warning(f"图谱客户端初始化失败: {e}")
+            self.kg = None
     
     def generate_profile_from_entity(
         self, 
@@ -285,53 +284,54 @@ class OasisProfileGenerator:
     def _search_zep_for_entity(self, entity: EntityNode) -> Dict[str, Any]:
         """
         使用Zep图谱混合搜索功能获取实体相关的丰富信息
-        
+
         Zep没有内置混合搜索接口，需要分别搜索edges和nodes然后合并结果。
         使用并行请求同时搜索，提高效率。
-        
+
         Args:
             entity: 实体节点对象
-            
+
         Returns:
             包含facts, node_summaries, context的字典
         """
         import concurrent.futures
-        
-        if not self.zep_client:
+
+        if not self.kg:
             return {"facts": [], "node_summaries": [], "context": ""}
-        
+
         entity_name = entity.name
-        
+
         results = {
             "facts": [],
             "node_summaries": [],
             "context": ""
         }
-        
+
         # 必须有graph_id才能进行搜索
         if not self.graph_id:
             logger.debug(f"跳过Zep检索：未设置graph_id")
             return results
-        
-        comprehensive_query = f"关于{entity_name}的所有信息、活动、事件、关系和背景"
-        
+
+        # 使用实体名称作为查询，而不是复杂的中文描述
+        # Zep Cloud search 对中文支持有限，尝试直接用实体名搜索
+        comprehensive_query = entity_name
+
         def search_edges():
             """搜索边（事实/关系）- 带重试机制"""
             max_retries = 3
-            last_exception = None
             delay = 2.0
-            
+
             for attempt in range(max_retries):
                 try:
-                    return self.zep_client.graph.search(
+                    result = self.kg.search(
                         query=comprehensive_query,
                         graph_id=self.graph_id,
                         limit=30,
                         scope="edges",
                         reranker="rrf"
                     )
+                    return result
                 except Exception as e:
-                    last_exception = e
                     if attempt < max_retries - 1:
                         logger.debug(f"Zep边搜索第 {attempt + 1} 次失败: {str(e)[:80]}, 重试中...")
                         time.sleep(delay)
@@ -343,12 +343,11 @@ class OasisProfileGenerator:
         def search_nodes():
             """搜索节点（实体摘要）- 带重试机制"""
             max_retries = 3
-            last_exception = None
             delay = 2.0
             
             for attempt in range(max_retries):
                 try:
-                    return self.zep_client.graph.search(
+                    return self.kg.search(
                         query=comprehensive_query,
                         graph_id=self.graph_id,
                         limit=20,
@@ -356,7 +355,6 @@ class OasisProfileGenerator:
                         reranker="rrf"
                     )
                 except Exception as e:
-                    last_exception = e
                     if attempt < max_retries - 1:
                         logger.debug(f"Zep节点搜索第 {attempt + 1} 次失败: {str(e)[:80]}, 重试中...")
                         time.sleep(delay)

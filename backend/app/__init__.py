@@ -11,6 +11,7 @@ warnings.filterwarnings("ignore", message=".*resource_tracker.*")
 
 from flask import Flask, request
 from flask_cors import CORS
+from flask_caching import Cache
 
 from .config import Config
 from .utils.logger import setup_logger, get_logger
@@ -20,7 +21,15 @@ def create_app(config_class=Config):
     """Flask应用工厂函数"""
     app = Flask(__name__)
     app.config.from_object(config_class)
-    
+
+    # 配置缓存
+    cache_config = {
+        'CACHE_TYPE': 'SimpleCache',  # 生产环境可改为 Redis
+        'CACHE_DEFAULT_TIMEOUT': 300,  # 默认 5 分钟缓存
+    }
+    cache = Cache(app, config=cache_config)
+    app.cache = cache  # 挂载到 app 上方便其他地方使用
+
     # 设置JSON编码：确保中文直接显示（而不是 \uXXXX 格式）
     # Flask >= 2.3 使用 app.json.ensure_ascii，旧版本使用 JSON_AS_ASCII 配置
     if hasattr(app, 'json') and hasattr(app.json, 'ensure_ascii'):

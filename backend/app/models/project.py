@@ -5,12 +5,14 @@
 
 import os
 import json
+import threading
 import uuid
 import shutil
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from enum import Enum
 from dataclasses import dataclass, field, asdict
+from functools import lru_cache
 from ..config import Config
 
 
@@ -100,10 +102,27 @@ class Project:
 
 class ProjectManager:
     """项目管理器 - 负责项目的持久化存储和检索"""
-    
+
     # 项目存储根目录
     PROJECTS_DIR = os.path.join(Config.UPLOAD_FOLDER, 'projects')
+
+    # 内存缓存（项目ID -> Project 对象）
+    _project_cache: Dict[str, Project] = {}
+
+    # 线程安全锁
+    _cache_lock = threading.Lock()
+
+    # 列表缓存（用于 list_projects）
+    _list_cache: Optional[List[Project]] = None
+    _list_cache_time: Optional[datetime] = None
+    _LIST_CACHE_TTL = 30  # 缓存 30 秒
     
+    @classmethod
+    def _invalidate_cache(cls):
+        """清除列表缓存"""
+        cls._list_cache = None
+        cls._list_cache_time = None
+
     @classmethod
     def _ensure_projects_dir(cls):
         """确保项目目录存在"""
@@ -133,18 +152,18 @@ class ProjectManager:
     def create_project(cls, name: str = "Unnamed Project") -> Project:
         """
         创建新项目
-        
+
         Args:
             name: 项目名称
-            
+
         Returns:
             新创建的Project对象
         """
         cls._ensure_projects_dir()
-        
+
         project_id = f"proj_{uuid.uuid4().hex[:12]}"
         now = datetime.now().isoformat()
-        
+
         project = Project(
             project_id=project_id,
             name=name,
@@ -152,16 +171,19 @@ class ProjectManager:
             created_at=now,
             updated_at=now
         )
-        
+
         # 创建项目目录结构
         project_dir = cls._get_project_dir(project_id)
         files_dir = cls._get_project_files_dir(project_id)
         os.makedirs(project_dir, exist_ok=True)
         os.makedirs(files_dir, exist_ok=True)
-        
+
         # 保存项目元数据
         cls.save_project(project)
-        
+
+        # 清除列表缓存
+        cls._invalidate_cache()
+
         return project
     
     @classmethod
@@ -169,72 +191,107 @@ class ProjectManager:
         """保存项目元数据"""
         project.updated_at = datetime.now().isoformat()
         meta_path = cls._get_project_meta_path(project.project_id)
-        
+
         with open(meta_path, 'w', encoding='utf-8') as f:
             json.dump(project.to_dict(), f, ensure_ascii=False, indent=2)
+
+        # 更新缓存
+        with cls._cache_lock:
+            cls._project_cache[project.project_id] = project
+            cls._invalidate_cache()
     
     @classmethod
     def get_project(cls, project_id: str) -> Optional[Project]:
         """
         获取项目
-        
+
         Args:
             project_id: 项目ID
-            
+
         Returns:
             Project对象，如果不存在返回None
         """
+        # 先从缓存获取
+        with cls._cache_lock:
+            if project_id in cls._project_cache:
+                return cls._project_cache[project_id]
+
         meta_path = cls._get_project_meta_path(project_id)
-        
+
         if not os.path.exists(meta_path):
             return None
-        
+
         with open(meta_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
-        return Project.from_dict(data)
+
+        project = Project.from_dict(data)
+        # 存入缓存
+        with cls._cache_lock:
+            cls._project_cache[project_id] = project
+        return project
     
     @classmethod
     def list_projects(cls, limit: int = 50) -> List[Project]:
         """
         列出所有项目
-        
+
         Args:
             limit: 返回数量限制
-            
+
         Returns:
             项目列表，按创建时间倒序
         """
         cls._ensure_projects_dir()
-        
+
+        # 检查缓存是否有效
+        now = datetime.now()
+        with cls._cache_lock:
+            if cls._list_cache is not None and cls._list_cache_time is not None:
+                cache_age = (now - cls._list_cache_time).total_seconds()
+                if cache_age < cls._LIST_CACHE_TTL:
+                    return cls._list_cache[:limit]
+
+        # 重新加载列表
         projects = []
         for project_id in os.listdir(cls.PROJECTS_DIR):
             project = cls.get_project(project_id)
             if project:
                 projects.append(project)
-        
+
         # 按创建时间倒序排序
         projects.sort(key=lambda p: p.created_at, reverse=True)
-        
+
+        # 更新缓存
+        with cls._cache_lock:
+            cls._list_cache = projects
+            cls._list_cache_time = now
+
         return projects[:limit]
     
     @classmethod
     def delete_project(cls, project_id: str) -> bool:
         """
         删除项目及其所有文件
-        
+
         Args:
             project_id: 项目ID
-            
+
         Returns:
             是否删除成功
         """
         project_dir = cls._get_project_dir(project_id)
-        
+
         if not os.path.exists(project_dir):
             return False
-        
+
         shutil.rmtree(project_dir)
+
+        # 清除缓存
+        with cls._cache_lock:
+            if project_id in cls._project_cache:
+                del cls._project_cache[project_id]
+            cls._invalidate_cache()
+
         return True
     
     @classmethod

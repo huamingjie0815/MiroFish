@@ -1,0 +1,41 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    volumes:
+      - mirofish_data:/app
+    env_file:
+      - .env.local
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    command: >
+      bash -c " if [ -d .git ]; then
+        git pull;
+      else
+        git clone https://github.com/huamingjie0815/MiroFish.git .;
+      fi && npm run setup:all && npm run dev"
+    ports:
+      - "3000:3000"
+      - "5001:5001"
+
+  neo4j:
+    image: neo4j:latest
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/neo4j123456
+      - NEO4J_PLUGINS=["graph-data-science", "apoc"]
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: [ "CMD-SHELL", "neo4j status || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mirofish_data:
+  neo4j_data:

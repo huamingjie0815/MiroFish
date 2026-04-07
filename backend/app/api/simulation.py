@@ -56,18 +56,18 @@ def get_graph_entities(graph_id: str):
         enrich: 是否获取相关边信息（默认true）
     """
     try:
-        if not Config.ZEP_API_KEY:
+        if Config.KNOWLEDGE_GRAPH_MODE == 'cloud' and not Config.ZEP_API_KEY:
             return jsonify({
                 "success": False,
                 "error": "ZEP_API_KEY未配置"
             }), 500
-        
+
         entity_types_str = request.args.get('entity_types', '')
         entity_types = [t.strip() for t in entity_types_str.split(',') if t.strip()] if entity_types_str else None
         enrich = request.args.get('enrich', 'true').lower() == 'true'
-        
+
         logger.info(f"获取图谱实体: graph_id={graph_id}, entity_types={entity_types}, enrich={enrich}")
-        
+
         reader = ZepEntityReader()
         result = reader.filter_defined_entities(
             graph_id=graph_id,
@@ -93,12 +93,12 @@ def get_graph_entities(graph_id: str):
 def get_entity_detail(graph_id: str, entity_uuid: str):
     """获取单个实体的详细信息"""
     try:
-        if not Config.ZEP_API_KEY:
+        if Config.KNOWLEDGE_GRAPH_MODE == 'cloud' and not Config.ZEP_API_KEY:
             return jsonify({
                 "success": False,
                 "error": "ZEP_API_KEY未配置"
             }), 500
-        
+
         reader = ZepEntityReader()
         entity = reader.get_entity_with_context(graph_id, entity_uuid)
         
@@ -126,12 +126,12 @@ def get_entity_detail(graph_id: str, entity_uuid: str):
 def get_entities_by_type(graph_id: str, entity_type: str):
     """获取指定类型的所有实体"""
     try:
-        if not Config.ZEP_API_KEY:
+        if Config.KNOWLEDGE_GRAPH_MODE == 'cloud' and not Config.ZEP_API_KEY:
             return jsonify({
                 "success": False,
                 "error": "ZEP_API_KEY未配置"
             }), 500
-        
+
         enrich = request.args.get('enrich', 'true').lower() == 'true'
         
         reader = ZepEntityReader()
@@ -305,9 +305,9 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
         # - preparing: 如果 config_generated=True 说明已完成
         # - running: 正在运行，说明准备早就完成了
         # - completed: 运行完成，说明准备早就完成了
-        # - stopped: 已停止，说明准备早就完成了
+        # - stopped / paused: 已停止（runner 或用户主动停止），准备文件仍存在
         # - failed: 运行失败（但准备是完成的）
-        prepared_statuses = ["ready", "preparing", "running", "completed", "stopped", "failed"]
+        prepared_statuses = ["ready", "preparing", "running", "completed", "stopped", "paused", "failed"]
         if status in prepared_statuses and config_generated:
             # 获取文件统计信息
             profiles_file = os.path.join(simulation_dir, "reddit_profiles.json")
@@ -982,6 +982,44 @@ def get_simulation_history():
         }), 500
 
 
+@simulation_bp.route('/<simulation_id>', methods=['DELETE'])
+def delete_simulation(simulation_id: str):
+    """
+    删除模拟及其所有相关数据
+
+    Args:
+        simulation_id: 模拟ID
+
+    Returns:
+        {
+            "success": true,
+            "message": "删除成功"
+        }
+    """
+    try:
+        manager = SimulationManager()
+        success = manager.delete_simulation(simulation_id)
+
+        if success:
+            return jsonify({
+                "success": True,
+                "message": "删除成功"
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": "删除失败，模拟可能不存在"
+            }), 404
+
+    except Exception as e:
+        logger.error(f"删除模拟失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
 @simulation_bp.route('/<simulation_id>/profiles', methods=['GET'])
 def get_simulation_profiles(simulation_id: str):
     """
@@ -1409,7 +1447,7 @@ def generate_profiles():
                 "error": "没有找到符合条件的实体"
             }), 400
         
-        generator = OasisProfileGenerator()
+        generator = OasisProfileGenerator(graph_id=graph_id)
         profiles = generator.generate_profiles_from_entities(
             entities=filtered.entities,
             use_llm=use_llm
@@ -1539,7 +1577,8 @@ def start_simulation():
 
             if is_prepared:
                 # 准备工作已完成，检查是否有正在运行的进程
-                if state.status == SimulationStatus.RUNNING:
+                # RUNNING 和 PAUSED（用户主动停止后状态）都需要检查底层进程是否还活着
+                if state.status in (SimulationStatus.RUNNING, SimulationStatus.PAUSED):
                     # 检查模拟进程是否真的在运行
                     run_state = SimulationRunner.get_run_state(simulation_id)
                     if run_state and run_state.runner_status.value == "running":
@@ -2440,7 +2479,7 @@ def interview_all_agents():
         simulation_id = data.get('simulation_id')
         prompt = data.get('prompt')
         platform = data.get('platform')  # 可选：twitter/reddit/None
-        timeout = data.get('timeout', 180)
+        timeout = data.get('timeout', 240)
 
         if not simulation_id:
             return jsonify({

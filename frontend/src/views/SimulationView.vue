@@ -73,6 +73,7 @@ import { getSimulation, stopSimulation, getEnvStatus, closeSimulationEnv } from 
 
 const route = useRoute()
 const router = useRouter()
+const RUN_INTENT_STORAGE_PREFIX = 'mirofish:simulation-run-intent:'
 
 // Props
 const props = defineProps({
@@ -153,6 +154,17 @@ const handleNextStep = (params = {}) => {
     addLog(`自定义模拟轮数: ${params.maxRounds} 轮`)
   } else {
     addLog('使用自动配置的模拟轮数')
+  }
+
+  if (typeof window !== 'undefined' && currentSimulationId.value) {
+    // 用一次性 intent 区分“用户明确要重跑”与“页面刷新后恢复现场”。
+    window.sessionStorage.setItem(
+      `${RUN_INTENT_STORAGE_PREFIX}${currentSimulationId.value}`,
+      JSON.stringify({
+        requestedAt: Date.now(),
+        maxRounds: Number.isFinite(params.maxRounds) ? params.maxRounds : null
+      })
+    )
   }
   
   // 构建路由参数
@@ -431,4 +443,3 @@ onMounted(async () => {
   border-right: 1px solid #EAEAEA;
 }
 </style>
-

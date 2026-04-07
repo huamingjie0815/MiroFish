@@ -559,6 +559,97 @@ def chat_with_report_agent():
         }), 500
 
 
+# ============== 章节重试接口 ==============
+
+@report_bp.route('/<report_id>/retry-section', methods=['POST'])
+def retry_section(report_id: str):
+    """
+    向正在等待的章节生成线程发送操作指令（重试/跳过/中止）。
+
+    若当前有正在阻塞的生成线程（section_failed 状态），直接唤醒。
+    若服务器已重启、线程不存在，action=retry 时自动从断点续传启动新线程。
+
+    请求（JSON）：
+        {
+            "action": "retry"   // "retry" | "skip" | "abort"
+        }
+    """
+    data = request.get_json() or {}
+    action = data.get('action', 'retry')
+
+    if action not in ('retry', 'skip', 'abort'):
+        return jsonify({
+            "success": False,
+            "error": "无效操作，action 必须为 retry / skip / abort"
+        }), 400
+
+    # 优先尝试唤醒已有阻塞线程
+    success = ReportAgent.resume_section(report_id, action)
+    if success:
+        return jsonify({"success": True, "message": f"已发送 {action} 指令"})
+
+    # 没有等待中的线程（服务器重启场景）
+    if action != 'retry':
+        # skip / abort 在无线程时没有意义
+        return jsonify({
+            "success": False,
+            "error": "没有等待中的章节生成任务，服务器可能已重启，请使用重试从断点续传"
+        }), 404
+
+    # ── 断点续传：从 meta.json 恢复上下文，启动新线程 ──
+    meta = ReportManager.load_report_meta(report_id)
+    if not meta:
+        return jsonify({
+            "success": False,
+            "error": f"找不到报告元数据: {report_id}"
+        }), 404
+
+    simulation_id = meta.get('simulation_id')
+    graph_id = meta.get('graph_id')
+    simulation_requirement = meta.get('simulation_requirement')
+
+    if not all([simulation_id, graph_id, simulation_requirement]):
+        return jsonify({
+            "success": False,
+            "error": "报告元数据不完整，无法续传"
+        }), 400
+
+    # 重置 progress 状态为 generating，让前端轮询停止显示重试面板
+    ReportManager.reset_progress_for_resume(report_id)
+
+    task_manager = TaskManager()
+    task_id = task_manager.create_task(
+        task_type="report_resume",
+        metadata={"simulation_id": simulation_id, "report_id": report_id}
+    )
+
+    def run_resume():
+        try:
+            agent = ReportAgent(
+                graph_id=graph_id,
+                simulation_id=simulation_id,
+                simulation_requirement=simulation_requirement
+            )
+            report = agent.generate_report(report_id=report_id)
+            ReportManager.save_report(report)
+            if report.status == ReportStatus.COMPLETED:
+                task_manager.complete_task(task_id, result={"report_id": report_id})
+            else:
+                task_manager.fail_task(task_id, report.error or "续传失败")
+        except Exception as e:
+            logger.error(f"报告续传失败 {report_id}: {e}")
+            task_manager.fail_task(task_id, str(e))
+
+    thread = threading.Thread(target=run_resume, daemon=True)
+    thread.start()
+
+    return jsonify({
+        "success": True,
+        "message": "已从断点恢复生成，请继续等待...",
+        "task_id": task_id
+    })
+
+
 # ============== 报告进度与分章节接口 ==============
 
 @report_bp.route('/<report_id>/progress', methods=['GET'])

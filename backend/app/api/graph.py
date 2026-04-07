@@ -178,7 +178,7 @@ def generate_ontology():
         
         # 保存文件并提取文本
         document_texts = []
-        all_text = ""
+        all_text_parts = []
         
         for file in uploaded_files:
             if file and file.filename and allowed_file(file.filename):
@@ -197,7 +197,7 @@ def generate_ontology():
                 text = FileParser.extract_text(file_info["path"])
                 text = TextProcessor.preprocess_text(text)
                 document_texts.append(text)
-                all_text += f"\n\n=== {file_info['original_filename']} ===\n{text}"
+                all_text_parts.append(f"\n\n=== {file_info['original_filename']} ===\n{text}")
         
         if not document_texts:
             ProjectManager.delete_project(project.project_id)
@@ -207,6 +207,7 @@ def generate_ontology():
             }), 400
         
         # 保存提取的文本
+        all_text = "".join(all_text_parts)
         project.total_text_length = len(all_text)
         ProjectManager.save_extracted_text(project.project_id, all_text)
         logger.info(f"文本提取完成，共 {len(all_text)} 字符")
@@ -282,9 +283,9 @@ def build_graph():
     try:
         logger.info("=== 开始构建图谱 ===")
         
-        # 检查配置
+        # 检查配置 (cloud 模式需要 Zep Cloud)
         errors = []
-        if not Config.ZEP_API_KEY:
+        if Config.KNOWLEDGE_GRAPH_MODE == 'cloud' and not Config.ZEP_API_KEY:
             errors.append("ZEP_API_KEY未配置")
         if errors:
             logger.error(f"配置错误: {errors}")
@@ -374,7 +375,7 @@ def build_graph():
         def build_task():
             build_logger = get_logger('mirofish.build')
             try:
-                build_logger.info(f"[{task_id}] 开始构建图谱...")
+                build_logger.debug(f"[{task_id}] 开始构建图谱...")
                 task_manager.update_task(
                     task_id, 
                     status=TaskStatus.PROCESSING,
@@ -410,12 +411,15 @@ def build_graph():
                 ProjectManager.save_project(project)
                 
                 # 设置本体
+                build_logger.debug(f"[{task_id}] 准备设置本体...")
                 task_manager.update_task(
                     task_id,
                     message="设置本体定义...",
                     progress=15
                 )
+                build_logger.debug(f"[{task_id}] 开始设置本体...")
                 builder.set_ontology(graph_id, ontology)
+                build_logger.debug(f"[{task_id}] 本体设置完成")
                 
                 # 添加文本（progress_callback 签名是 (msg, progress_ratio)）
                 def add_progress_callback(msg, progress_ratio):
@@ -431,15 +435,18 @@ def build_graph():
                     message=f"开始添加 {total_chunks} 个文本块...",
                     progress=15
                 )
-                
+
+                build_logger.debug(f"[{task_id}] 准备添加文本，共 {total_chunks} 个块")
                 episode_uuids = builder.add_text_batches(
-                    graph_id, 
+                    graph_id,
                     chunks,
                     batch_size=3,
                     progress_callback=add_progress_callback
                 )
+                build_logger.debug(f"[{task_id}] 文本添加完成，共 {len(episode_uuids)} 个 episode")
                 
                 # 等待Zep处理完成（查询每个episode的processed状态）
+                build_logger.debug(f"[{task_id}] 开始等待处理，共 {len(episode_uuids)} 个 episode")
                 task_manager.update_task(
                     task_id,
                     message="等待Zep处理数据...",
@@ -567,13 +574,13 @@ def get_graph_data(graph_id: str):
     获取图谱数据（节点和边）
     """
     try:
-        if not Config.ZEP_API_KEY:
+        if Config.KNOWLEDGE_GRAPH_MODE == 'cloud' and not Config.ZEP_API_KEY:
             return jsonify({
                 "success": False,
                 "error": "ZEP_API_KEY未配置"
             }), 500
-        
-        builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
+
+        builder = GraphBuilderService()
         graph_data = builder.get_graph_data(graph_id)
         
         return jsonify({
@@ -595,13 +602,13 @@ def delete_graph(graph_id: str):
     删除Zep图谱
     """
     try:
-        if not Config.ZEP_API_KEY:
+        if Config.KNOWLEDGE_GRAPH_MODE == 'cloud' and not Config.ZEP_API_KEY:
             return jsonify({
                 "success": False,
                 "error": "ZEP_API_KEY未配置"
             }), 500
-        
-        builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
+
+        builder = GraphBuilderService()
         builder.delete_graph(graph_id)
         
         return jsonify({

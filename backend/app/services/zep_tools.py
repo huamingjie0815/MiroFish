@@ -1,6 +1,7 @@
 """
-Zep检索工具服务
+图谱检索工具服务
 封装图谱搜索、节点读取、边查询等工具，供Report Agent使用
+支持 Zep Cloud 和 Graphiti 两种模式
 
 核心检索工具（优化后）：
 1. InsightForge（深度洞察检索）- 最强大的混合检索，自动生成子问题并多维度检索
@@ -13,12 +14,10 @@ import json
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 
-from zep_cloud.client import Zep
-
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.llm_client import LLMClient
-from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
+from .kg_adapter import get_knowledge_graph_adapter
 
 logger = get_logger('mirofish.zep_tools')
 
@@ -61,7 +60,24 @@ class NodeInfo:
     labels: List[str]
     summary: str
     attributes: Dict[str, Any]
-    
+
+    def __init__(self, uuid: str = "", name: str = "", labels: List[str] = None,
+                 summary: str = "", attributes: Dict[str, Any] = None):
+        # 如果传入的是 dict，转换为对象属性
+        if isinstance(uuid, dict):
+            d = uuid
+            self.uuid = d.get('uuid_') or d.get('uuid', '')
+            self.name = d.get('name', '')
+            self.labels = d.get('labels', [])
+            self.summary = d.get('summary', '')
+            self.attributes = d.get('attributes', {})
+        else:
+            self.uuid = uuid or ''
+            self.name = name or ''
+            self.labels = labels or []
+            self.summary = summary or ''
+            self.attributes = attributes or {}
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "uuid": self.uuid,
@@ -70,7 +86,7 @@ class NodeInfo:
             "summary": self.summary,
             "attributes": self.attributes
         }
-    
+
     def to_text(self) -> str:
         """转换为文本格式"""
         entity_type = next((l for l in self.labels if l not in ["Entity", "Node"]), "未知类型")
@@ -92,7 +108,39 @@ class EdgeInfo:
     valid_at: Optional[str] = None
     invalid_at: Optional[str] = None
     expired_at: Optional[str] = None
-    
+
+    def __init__(self, uuid: str = "", name: str = "", fact: str = "",
+                 source_node_uuid: str = "", target_node_uuid: str = "",
+                 source_node_name: str = None, target_node_name: str = None,
+                 created_at: str = None, valid_at: str = None,
+                 invalid_at: str = None, expired_at: str = None):
+        # 如果传入的是 dict，转换为对象属性
+        if isinstance(uuid, dict):
+            d = uuid
+            self.uuid = d.get('uuid_') or d.get('uuid', '')
+            self.name = d.get('name', 'RELATED')
+            self.fact = d.get('fact', '')
+            self.source_node_uuid = d.get('source_node_uuid', '')
+            self.target_node_uuid = d.get('target_node_uuid', '')
+            self.source_node_name = d.get('source_node_name')
+            self.target_node_name = d.get('target_node_name')
+            self.created_at = d.get('created_at')
+            self.valid_at = d.get('valid_at')
+            self.invalid_at = d.get('invalid_at')
+            self.expired_at = d.get('expired_at')
+        else:
+            self.uuid = uuid or ''
+            self.name = name or 'RELATED'
+            self.fact = fact or ''
+            self.source_node_uuid = source_node_uuid or ''
+            self.target_node_uuid = target_node_uuid or ''
+            self.source_node_name = source_node_name
+            self.target_node_name = target_node_name
+            self.created_at = created_at
+            self.valid_at = valid_at
+            self.invalid_at = invalid_at
+            self.expired_at = expired_at
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "uuid": self.uuid,
@@ -422,11 +470,9 @@ class ZepToolsService:
     RETRY_DELAY = 2.0
     
     def __init__(self, api_key: Optional[str] = None, llm_client: Optional[LLMClient] = None):
-        self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = Zep(api_key=self.api_key)
+        self.api_key = api_key  # 保留参数兼容性
+        # 使用适配器
+        self.kg = get_knowledge_graph_adapter()
         # LLM客户端用于InsightForge生成子问题
         self._llm_client = llm_client
         logger.info("ZepToolsService 初始化完成")
@@ -485,15 +531,13 @@ class ZepToolsService:
         """
         logger.info(f"图谱搜索: graph_id={graph_id}, query={query[:50]}...")
         
-        # 尝试使用Zep Cloud Search API
+        # 尝试使用图谱搜索 API
         try:
             search_results = self._call_with_retry(
-                func=lambda: self.client.graph.search(
+                func=lambda: self.kg.search(
                     graph_id=graph_id,
                     query=query,
                     limit=limit,
-                    scope=scope,
-                    reranker="cross_encoder"
                 ),
                 operation_name=f"图谱搜索(graph={graph_id})"
             )
@@ -501,33 +545,62 @@ class ZepToolsService:
             facts = []
             edges = []
             nodes = []
-            
-            # 解析边搜索结果
-            if hasattr(search_results, 'edges') and search_results.edges:
-                for edge in search_results.edges:
-                    if hasattr(edge, 'fact') and edge.fact:
-                        facts.append(edge.fact)
-                    edges.append({
-                        "uuid": getattr(edge, 'uuid_', None) or getattr(edge, 'uuid', ''),
-                        "name": getattr(edge, 'name', ''),
-                        "fact": getattr(edge, 'fact', ''),
-                        "source_node_uuid": getattr(edge, 'source_node_uuid', ''),
-                        "target_node_uuid": getattr(edge, 'target_node_uuid', ''),
-                    })
-            
-            # 解析节点搜索结果
-            if hasattr(search_results, 'nodes') and search_results.nodes:
-                for node in search_results.nodes:
-                    nodes.append({
-                        "uuid": getattr(node, 'uuid_', None) or getattr(node, 'uuid', ''),
-                        "name": getattr(node, 'name', ''),
-                        "labels": getattr(node, 'labels', []),
-                        "summary": getattr(node, 'summary', ''),
-                    })
-                    # 节点摘要也算作事实
-                    if hasattr(node, 'summary') and node.summary:
-                        facts.append(f"[{node.name}]: {node.summary}")
-            
+
+            # 解析搜索结果（兼容对象和字典格式）
+            # 适配器返回的是 List[Dict]，需要处理
+            if isinstance(search_results, list):
+                for result in search_results:
+                    # 判断是边还是节点
+                    if isinstance(result, dict):
+                        if result.get('source_node_uuid') and result.get('target_node_uuid'):
+                            # 边
+                            fact = result.get('fact', '')
+                            if fact:
+                                facts.append(fact)
+                            edges.append({
+                                "uuid": result.get('uuid_', '') or result.get('uuid', ''),
+                                "name": result.get('name', ''),
+                                "fact": fact,
+                                "source_node_uuid": result.get('source_node_uuid', ''),
+                                "target_node_uuid": result.get('target_node_uuid', ''),
+                            })
+                        else:
+                            # 节点
+                            name = result.get('name', '')
+                            summary = result.get('summary', '')
+                            nodes.append({
+                                "uuid": result.get('uuid_', '') or result.get('uuid', ''),
+                                "name": name,
+                                "labels": result.get('labels', []),
+                                "summary": summary,
+                            })
+                            if summary:
+                                facts.append(f"[{name}]: {summary}")
+            else:
+                # 原始对象格式（保留兼容性）
+                if hasattr(search_results, 'edges') and search_results.edges:
+                    for edge in search_results.edges:
+                        if hasattr(edge, 'fact') and edge.fact:
+                            facts.append(edge.fact)
+                        edges.append({
+                            "uuid": getattr(edge, 'uuid_', None) or getattr(edge, 'uuid', ''),
+                            "name": getattr(edge, 'name', ''),
+                            "fact": getattr(edge, 'fact', ''),
+                            "source_node_uuid": getattr(edge, 'source_node_uuid', ''),
+                            "target_node_uuid": getattr(edge, 'target_node_uuid', ''),
+                        })
+
+                if hasattr(search_results, 'nodes') and search_results.nodes:
+                    for node in search_results.nodes:
+                        nodes.append({
+                            "uuid": getattr(node, 'uuid_', None) or getattr(node, 'uuid', ''),
+                            "name": getattr(node, 'name', ''),
+                            "labels": getattr(node, 'labels', []),
+                            "summary": getattr(node, 'summary', ''),
+                        })
+                        if hasattr(node, 'summary') and node.summary:
+                            facts.append(f"[{node.name}]: {node.summary}")
+
             logger.info(f"搜索完成: 找到 {len(facts)} 条相关事实")
             
             return SearchResult(
@@ -659,7 +732,38 @@ class ZepToolsService:
         """
         logger.info(f"获取图谱 {graph_id} 的所有节点...")
 
-        nodes = fetch_all_nodes(self.client, graph_id)
+        # 使用适配器分页获取所有节点
+        # Zep Cloud API 使用 uuid_cursor 分页，但响应不返回 cursor
+        # 通过返回数量判断是否有更多：< limit 则说明是最后一页
+        nodes = []
+        cursor = None
+        max_pages = 100  # 最多获取 100 页，防止无限循环
+        page_count = 0
+
+        while page_count < max_pages:
+            page = self.kg.get_nodes(graph_id, limit=100, cursor=cursor)
+            if not page:
+                break
+            # 将 dict 转换为 NodeInfo 对象
+            for item in page:
+                if isinstance(item, dict):
+                    nodes.append(NodeInfo(item))
+                else:
+                    nodes.append(item)
+            page_count += 1
+
+            # 如果返回数量 < limit，说明是最后一页
+            if len(page) < 100:
+                break
+
+            # 尝试获取下一页 - Zep Cloud 使用 uuid_cursor 参数
+            # 由于 API 不返回 next_cursor，我们需要用最后一条的 uuid 作为 cursor
+            last_item = page[-1]
+            cursor = getattr(last_item, 'uuid_', None) or getattr(last_item, 'uuid', None)
+            if not cursor:
+                break
+
+        logger.info(f"分页获取完成，共 {page_count} 页，{len(nodes)} 个节点")
 
         result = []
         for node in nodes:
@@ -688,7 +792,33 @@ class ZepToolsService:
         """
         logger.info(f"获取图谱 {graph_id} 的所有边...")
 
-        edges = fetch_all_edges(self.client, graph_id)
+        # 使用适配器分页获取所有边
+        edges = []
+        cursor = None
+        max_pages = 100
+        page_count = 0
+
+        while page_count < max_pages:
+            page = self.kg.get_edges(graph_id, limit=100, cursor=cursor)
+            if not page:
+                break
+            # 将 dict 转换为 EdgeInfo 对象
+            for item in page:
+                if isinstance(item, dict):
+                    edges.append(EdgeInfo(item))
+                else:
+                    edges.append(item)
+            page_count += 1
+
+            if len(page) < 100:
+                break
+
+            last_item = page[-1]
+            cursor = getattr(last_item, 'uuid_', None) or (last_item.get('uuid_') if isinstance(last_item, dict) else None) or (last_item.get('uuid') if isinstance(last_item, dict) else None)
+            if not cursor:
+                break
+
+        logger.info(f"分页获取完成，共 {page_count} 页，{len(edges)} 条边")
 
         result = []
         for edge in edges:
@@ -724,23 +854,33 @@ class ZepToolsService:
             节点信息或None
         """
         logger.info(f"获取节点详情: {node_uuid[:8]}...")
-        
+
         try:
             node = self._call_with_retry(
-                func=lambda: self.client.graph.node.get(uuid_=node_uuid),
+                func=lambda: self.kg.get_node(node_uuid),
                 operation_name=f"获取节点详情(uuid={node_uuid[:8]}...)"
             )
-            
+
             if not node:
                 return None
-            
-            return NodeInfo(
-                uuid=getattr(node, 'uuid_', None) or getattr(node, 'uuid', ''),
-                name=node.name or "",
-                labels=node.labels or [],
-                summary=node.summary or "",
-                attributes=node.attributes or {}
-            )
+
+            # 兼容对象和字典格式
+            if isinstance(node, dict):
+                return NodeInfo(
+                    uuid=node.get('uuid_', '') or node.get('uuid', ''),
+                    name=node.get('name', ''),
+                    labels=node.get('labels', []),
+                    summary=node.get('summary', ''),
+                    attributes=node.get('attributes', {})
+                )
+            else:
+                return NodeInfo(
+                    uuid=getattr(node, 'uuid_', None) or getattr(node, 'uuid', ''),
+                    name=node.name or "",
+                    labels=node.labels or [],
+                    summary=node.summary or "",
+                    attributes=node.attributes or {}
+                )
         except Exception as e:
             logger.error(f"获取节点详情失败: {str(e)}")
             return None
@@ -863,22 +1003,24 @@ class ZepToolsService:
             统计信息
         """
         logger.info(f"获取图谱 {graph_id} 的统计信息...")
-        
+
         nodes = self.get_all_nodes(graph_id)
         edges = self.get_all_edges(graph_id)
-        
-        # 统计实体类型分布
+
+        # 统计实体类型分布（兼容 dict 和对象）
         entity_types = {}
         for node in nodes:
-            for label in node.labels:
+            labels = node.labels if hasattr(node, 'labels') else node.get('labels', [])
+            for label in labels:
                 if label not in ["Entity", "Node"]:
                     entity_types[label] = entity_types.get(label, 0) + 1
-        
-        # 统计关系类型分布
+
+        # 统计关系类型分布（兼容 dict 和对象）
         relation_types = {}
         for edge in edges:
-            relation_types[edge.name] = relation_types.get(edge.name, 0) + 1
-        
+            edge_name = edge.name if hasattr(edge, 'name') else edge.get('name', 'RELATED')
+            relation_types[edge_name] = relation_types.get(edge_name, 0) + 1
+
         return {
             "graph_id": graph_id,
             "total_nodes": len(nodes),
@@ -1650,6 +1792,7 @@ class ZepToolsService:
 4. 语言自然，像真实采访一样
 5. 每个问题控制在50字以内，简洁明了
 6. 直接提问，不要包含背景说明或前缀
+7. 问题数量根据采访需求的复杂度决定，简单主题1-5个，复杂主题最多3个
 
 返回JSON格式：{"questions": ["问题1", "问题2", ...]}"""
 
@@ -1676,8 +1819,7 @@ class ZepToolsService:
             logger.warning(f"生成采访问题失败: {e}")
             return [
                 f"关于{interview_requirement}，您的观点是什么？",
-                "这件事对您或您所代表的群体有什么影响？",
-                "您认为应该如何解决或改进这个问题？"
+                "这件事对您或您所代表的群体有什么影响？"
             ]
     
     def _generate_interview_summary(

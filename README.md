@@ -176,6 +176,62 @@ docker compose up -d
 
 > 在 `docker-compose.yml` 中已通过注释提供加速镜像地址，可按需替换
 
+### 三、Local Docker 部署（无需本地 Node/Python 环境）
+
+适合希望在任意机器上快速运行而不安装本地依赖的场景。容器启动时会自动从 GitHub 拉取最新代码并完成依赖安装。
+
+#### 前置要求
+
+- Docker & Docker Compose
+- 网络可访问 GitHub（用于容器内 clone 代码）
+
+#### 1. 配置环境变量
+
+```bash
+cp .env.example .env.local
+# 编辑 .env.local，填入必要的 API 密钥（同源码部署的环境变量）
+```
+
+#### 2. 构建镜像
+
+```bash
+docker-compose -f docker-compose.local.yml build
+```
+
+#### 3. 启动服务
+
+```bash
+docker-compose -f docker-compose.local.yml up
+```
+
+首次启动会自动：
+1. `git clone` 最新代码到容器内
+2. 运行 `npm run setup:all` 安装所有依赖
+3. 启动前后端服务
+
+**再次启动时**（代码已存在），容器会自动执行 `git pull` 拉取最新代码，无需重建镜像。
+
+#### 4. 重建镜像（依赖变更时）
+
+```bash
+docker-compose -f docker-compose.local.yml build --no-cache
+```
+
+#### 5. 停止并清除数据
+
+```bash
+# 仅停止
+docker-compose -f docker-compose.local.yml down
+
+# 停止并清除所有 volume（下次启动将重新 clone）
+docker-compose -f docker-compose.local.yml down -v
+```
+
+**服务地址：**
+- 前端：`http://localhost:3000`
+- 后端 API：`http://localhost:5001`
+- Neo4j 浏览器：`http://localhost:7474`（用户名/密码：`neo4j/neo4j123456`）
+
 ## 📬 更多交流
 
 <div align="center">

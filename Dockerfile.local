@@ -1,0 +1,5 @@
+FROM continuumio/anaconda3:latest
+
+RUN conda install -y -c conda-forge python=3.12 nodejs gcc uv
+
+WORKDIR /app

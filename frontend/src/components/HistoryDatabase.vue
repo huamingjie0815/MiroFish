@@ -89,11 +89,23 @@
             <span class="card-date">{{ formatDate(project.created_at) }}</span>
             <span class="card-time">{{ formatTime(project.created_at) }}</span>
           </div>
-          <span class="card-progress" :class="getProgressClass(project)">
-            <span class="status-dot">●</span> {{ formatRounds(project) }}
-          </span>
+          <div class="card-footer-right">
+            <span class="card-progress" :class="getProgressClass(project)">
+              <span class="status-dot">●</span> {{ formatRounds(project) }}
+            </span>
+            <!-- 删除按钮（hover时显示） -->
+            <button
+              class="card-delete-btn"
+              :class="{ deleting: deletingId === project.simulation_id }"
+              @click="openDeleteConfirm($event, project)"
+              title="删除"
+            >
+              <span v-if="deletingId === project.simulation_id" class="delete-spinner"></span>
+              <span v-else>×</span>
+            </button>
+          </div>
         </div>
-        
+
         <!-- 底部装饰线 (hover时展开) -->
         <div class="card-bottom-line"></div>
       </div>
@@ -187,13 +199,40 @@
         </div>
       </Transition>
     </Teleport>
+
+    <!-- 删除确认弹窗 -->
+    <Teleport to="body">
+      <Transition name="modal">
+        <div v-if="deleteConfirmModal" class="modal-overlay" @click.self="closeDeleteConfirm">
+          <div class="delete-confirm-modal">
+            <div class="delete-modal-header">
+              <span class="delete-modal-title">确认删除</span>
+              <button class="delete-modal-close" @click="closeDeleteConfirm">×</button>
+            </div>
+            <div class="delete-modal-body">
+              <p>确定要删除推演记录「{{ formatSimulationId(deleteConfirmModal.simulation_id) }}」吗？</p>
+              <p class="delete-warning">此操作不可恢复，将删除所有相关数据。</p>
+            </div>
+            <div class="delete-modal-actions">
+              <button class="delete-btn cancel" @click="closeDeleteConfirm" :disabled="deletingId">
+                取消
+              </button>
+              <button class="delete-btn confirm" @click="confirmDelete" :disabled="deletingId">
+                <span v-if="deletingId" class="delete-spinner"></span>
+                <span v-else>确认删除</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted, onActivated, watch, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { getSimulationHistory } from '../api/simulation'
+import { getSimulationHistory, deleteSimulation } from '../api/simulation'
 
 const router = useRouter()
 const route = useRoute()
@@ -205,6 +244,8 @@ const isExpanded = ref(false)
 const hoveringCard = ref(null)
 const historyContainer = ref(null)
 const selectedProject = ref(null)  // 当前选中的项目（用于弹窗）
+const deleteConfirmModal = ref(null)  // 删除确认弹窗
+const deletingId = ref(null)  // 正在删除的项目ID
 let observer = null
 let isAnimating = false  // 动画锁，防止闪烁
 let expandDebounceTimer = null  // 防抖定时器
@@ -431,6 +472,42 @@ const goToReport = () => {
       params: { reportId: selectedProject.value.report_id }
     })
     closeModal()
+  }
+}
+
+// 打开删除确认弹窗
+const openDeleteConfirm = (event, project) => {
+  event.stopPropagation()  // 阻止事件冒泡，避免打开详情弹窗
+  deleteConfirmModal.value = project
+}
+
+// 关闭删除确认弹窗
+const closeDeleteConfirm = () => {
+  deleteConfirmModal.value = null
+}
+
+// 执行删除
+const confirmDelete = async () => {
+  if (!deleteConfirmModal.value) return
+
+  const simulationId = deleteConfirmModal.value.simulation_id
+  deletingId.value = simulationId
+
+  try {
+    const response = await deleteSimulation(simulationId)
+    if (response.success) {
+      // 从列表中移除已删除的项目
+      projects.value = projects.value.filter(p => p.simulation_id !== simulationId)
+      closeDeleteConfirm()
+    } else {
+      console.error('删除失败:', response.error)
+      alert('删除失败: ' + response.error)
+    }
+  } catch (error) {
+    console.error('删除失败:', error)
+    alert('删除失败，请重试')
+  } finally {
+    deletingId.value = null
   }
 }
 
@@ -1336,5 +1413,165 @@ onUnmounted(() => {
   letter-spacing: 0.3px;
   text-align: center;
   line-height: 1.5;
+}
+
+/* ===== 卡片删除按钮 ===== */
+.card-footer-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.card-delete-btn {
+  width: 20px;
+  height: 20px;
+  border: none;
+  background: transparent;
+  color: #9CA3AF;
+  font-size: 1rem;
+  cursor: pointer;
+  opacity: 0;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  padding: 0;
+  line-height: 1;
+}
+
+.project-card:hover .card-delete-btn {
+  opacity: 1;
+}
+
+.card-delete-btn:hover {
+  background: #FEE2E2;
+  color: #EF4444;
+}
+
+.card-delete-btn.deleting {
+  opacity: 1;
+}
+
+.delete-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid #E5E7EB;
+  border-top-color: #EF4444;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+/* ===== 删除确认弹窗 ===== */
+.delete-confirm-modal {
+  background: #FFFFFF;
+  width: 400px;
+  max-width: 90vw;
+  border-radius: 12px;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+  overflow: hidden;
+}
+
+.delete-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 24px;
+  border-bottom: 1px solid #F3F4F6;
+}
+
+.delete-modal-title {
+  font-family: 'Inter', sans-serif;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #111827;
+}
+
+.delete-modal-close {
+  width: 32px;
+  height: 32px;
+  border: none;
+  background: transparent;
+  font-size: 1.5rem;
+  color: #9CA3AF;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  transition: all 0.2s ease;
+}
+
+.delete-modal-close:hover {
+  background: #F3F4F6;
+  color: #111827;
+}
+
+.delete-modal-body {
+  padding: 24px;
+}
+
+.delete-modal-body p {
+  margin: 0 0 12px 0;
+  font-size: 0.95rem;
+  color: #374151;
+  line-height: 1.5;
+}
+
+.delete-modal-body p:last-child {
+  margin-bottom: 0;
+}
+
+.delete-warning {
+  color: #EF4444 !important;
+  font-size: 0.85rem !important;
+}
+
+.delete-modal-actions {
+  display: flex;
+  gap: 12px;
+  padding: 16px 24px 24px;
+}
+
+.delete-btn {
+  flex: 1;
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-family: 'Inter', sans-serif;
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.delete-btn.cancel {
+  background: #F3F4F6;
+  border: 1px solid #E5E7EB;
+  color: #4B5563;
+}
+
+.delete-btn.cancel:hover:not(:disabled) {
+  background: #E5E7EB;
+  border-color: #D1D5DB;
+}
+
+.delete-btn.confirm {
+  background: #EF4444;
+  border: 1px solid #EF4444;
+  color: #FFFFFF;
+}
+
+.delete-btn.confirm:hover:not(:disabled) {
+  background: #DC2626;
+  border-color: #DC2626;
+}
+
+.delete-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 </style>

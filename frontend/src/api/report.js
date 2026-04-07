@@ -49,3 +49,30 @@ export const getReport = (reportId) => {
 export const chatWithReport = (data) => {
   return requestWithRetry(() => service.post('/api/report/chat', data), 3, 1000)
 }
+
+/**
+ * 下载报告文件
+ * @param {string} reportId
+ */
+export const downloadReport = (reportId) => {
+  return service.get(`/api/report/${reportId}/download`, {
+    responseType: 'blob'
+  })
+}
+
+/**
+ * 向正在等待的章节生成线程发送操作指令
+ * @param {string} reportId
+ * @param {'retry'|'skip'|'abort'} action - 操作类型
+ */
+export const retrySectionAction = (reportId, action) => {
+  return service.post(`/api/report/${reportId}/retry-section`, { action })
+}
+
+/**
+ * 获取报告生成进度（含章节失败详情）
+ * @param {string} reportId
+ */
+export const getReportProgress = (reportId) => {
+  return service.get(`/api/report/${reportId}/progress`)
+}

@@ -297,23 +297,41 @@ class IPCHandler:
             self.send_response(command_id, "failed", error=error_msg)
             return False
     
+    def _ensure_interview_index(self, db_path: str):
+        """确保trace表有Interview查询所需的索引"""
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            # 创建索引加速按action和user_id查询最新记录
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_trace_interview_lookup
+                ON trace(action, user_id, created_at DESC)
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"  创建索引失败: {e}")
+
     def _get_interview_result(self, agent_id: int) -> Dict[str, Any]:
         """从数据库获取最新的Interview结果"""
         db_path = os.path.join(self.simulation_dir, "twitter_simulation.db")
-        
+
         result = {
             "agent_id": agent_id,
             "response": None,
             "timestamp": None
         }
-        
+
         if not os.path.exists(db_path):
             return result
-        
+
         try:
+            # 确保索引存在
+            self._ensure_interview_index(db_path)
+
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
-            
+
             # 查询最新的Interview记录
             cursor.execute("""
                 SELECT user_id, info, created_at
@@ -322,7 +340,7 @@ class IPCHandler:
                 ORDER BY created_at DESC
                 LIMIT 1
             """, (ActionType.INTERVIEW.value, agent_id))
-            
+
             row = cursor.fetchone()
             if row:
                 user_id, info_json, created_at = row
@@ -332,12 +350,12 @@ class IPCHandler:
                     result["timestamp"] = created_at
                 except json.JSONDecodeError:
                     result["response"] = info_json
-            
+
             conn.close()
-            
+
         except Exception as e:
             print(f"  读取Interview结果失败: {e}")
-        
+
         return result
     
     async def process_commands(self) -> bool:

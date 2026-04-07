@@ -1,6 +1,7 @@
 """
-Zep图谱记忆更新服务
-将模拟中的Agent活动动态更新到Zep图谱中
+图谱记忆更新服务
+将模拟中的Agent活动动态更新到图谱中
+支持 Zep Cloud 和 Graphiti 两种模式
 """
 
 import os
@@ -12,10 +13,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from queue import Queue, Empty
 
-from zep_cloud.client import Zep
-
 from ..config import Config
 from ..utils.logger import get_logger
+from .kg_adapter import get_knowledge_graph_adapter
 
 logger = get_logger('mirofish.zep_graph_memory_updater')
 
@@ -200,49 +200,47 @@ class AgentActivity:
 
 class ZepGraphMemoryUpdater:
     """
-    Zep图谱记忆更新器
-    
-    监控模拟的actions日志文件，将新的agent活动实时更新到Zep图谱中。
-    按平台分组，每累积BATCH_SIZE条活动后批量发送到Zep。
-    
-    所有有意义的行为都会被更新到Zep，action_args中会包含完整的上下文信息：
+    图谱记忆更新器
+
+    监控模拟的actions日志文件，将新的agent活动实时更新到图谱中。
+    按平台分组，每累积BATCH_SIZE条活动后批量发送。
+
+    所有有意义的行为都会被更新到图谱，action_args中会包含完整的上下文信息：
     - 点赞/踩的帖子原文
     - 转发/引用的帖子原文
     - 关注/屏蔽的用户名
     - 点赞/踩的评论原文
     """
-    
+
     # 批量发送大小（每个平台累积多少条后发送）
     BATCH_SIZE = 5
-    
+
     # 平台名称映射（用于控制台显示）
     PLATFORM_DISPLAY_NAMES = {
         'twitter': '世界1',
         'reddit': '世界2',
     }
-    
+
     # 发送间隔（秒），避免请求过快
     SEND_INTERVAL = 0.5
-    
+
     # 重试配置
     MAX_RETRIES = 3
     RETRY_DELAY = 2  # 秒
-    
+
     def __init__(self, graph_id: str, api_key: Optional[str] = None):
         """
         初始化更新器
-        
+
         Args:
-            graph_id: Zep图谱ID
-            api_key: Zep API Key（可选，默认从配置读取）
+            graph_id: 图谱ID
+            api_key: 保留参数（兼容旧代码）
         """
         self.graph_id = graph_id
-        self.api_key = api_key or Config.ZEP_API_KEY
-        
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY未配置")
-        
-        self.client = Zep(api_key=self.api_key)
+        self.api_key = api_key  # 保留参数兼容性
+
+        # 使用适配器
+        self.kg = get_knowledge_graph_adapter()
         
         # 活动队列
         self._activity_queue: Queue = Queue()
@@ -401,29 +399,28 @@ class ZepGraphMemoryUpdater:
         # 将多条活动合并为一条文本，用换行分隔
         episode_texts = [activity.to_episode_text() for activity in activities]
         combined_text = "\n".join(episode_texts)
-        
+
         # 带重试的发送
         for attempt in range(self.MAX_RETRIES):
             try:
-                self.client.graph.add(
+                self.kg.add_episode(
                     graph_id=self.graph_id,
-                    type="text",
-                    data=combined_text
+                    text=combined_text
                 )
-                
+
                 self._total_sent += 1
                 self._total_items_sent += len(activities)
                 display_name = self._get_platform_display_name(platform)
                 logger.info(f"成功批量发送 {len(activities)} 条{display_name}活动到图谱 {self.graph_id}")
                 logger.debug(f"批量内容预览: {combined_text[:200]}...")
                 return
-                
+
             except Exception as e:
                 if attempt < self.MAX_RETRIES - 1:
-                    logger.warning(f"批量发送到Zep失败 (尝试 {attempt + 1}/{self.MAX_RETRIES}): {e}")
+                    logger.warning(f"批量发送到图谱失败 (尝试 {attempt + 1}/{self.MAX_RETRIES}): {e}")
                     time.sleep(self.RETRY_DELAY * (attempt + 1))
                 else:
-                    logger.error(f"批量发送到Zep失败，已重试{self.MAX_RETRIES}次: {e}")
+                    logger.error(f"批量发送到图谱失败，已重试{self.MAX_RETRIES}次: {e}")
                     self._failed_count += 1
     
     def _flush_remaining(self):
