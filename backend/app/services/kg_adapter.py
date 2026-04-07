@@ -524,8 +524,7 @@ class GraphitiAdapter(KnowledgeGraphAdapter):
             query = """
             MATCH (e:Entity {group_id: $group_id})
             RETURN e.uuid as uuid_, e.name as name, labels(e) as labels,
-                   e.summary as summary, e.created_at as created_at,
-                   e.entity_type as entity_type
+                   e.summary as summary, e.created_at as created_at
             LIMIT $limit
             """
             result = session.run(query, group_id=graph_id, limit=limit)
@@ -537,27 +536,21 @@ class GraphitiAdapter(KnowledgeGraphAdapter):
                 if 'attributes' not in node:
                     node['attributes'] = {}
 
-                # 优先使用 entity_type 属性
-                entity_type = node.get('entity_type')
-                if entity_type:
-                    node['labels'] = [entity_type]
-                    node['attributes']['entity_type'] = entity_type
-                else:
-                    # 从标签中提取实体类型（第一个非 Entity 的标签）
-                    labels = node.get('labels', [])
-                    found_type = None
-                    for label in labels:
-                        if label and label != 'Entity':
-                            found_type = label
-                            break
+                # 从标签中提取实体类型（第一个非 Entity 的标签）
+                labels = node.get('labels', [])
+                found_type = None
+                for label in labels:
+                    if label and label != 'Entity':
+                        found_type = label
+                        break
 
-                    if found_type:
-                        node['labels'] = [found_type]
-                        node['attributes']['entity_type'] = found_type
-                    else:
-                        # 如果都没有，使用节点名称作为类型
-                        node['labels'] = ['Entity']
-                        node['attributes']['entity_type'] = 'Entity'
+                if found_type:
+                    node['labels'] = [found_type]
+                    node['attributes']['entity_type'] = found_type
+                else:
+                    # 如果没有具体标签，使用通用 Entity 类型
+                    node['labels'] = ['Entity']
+                    node['attributes']['entity_type'] = 'Entity'
 
             return nodes
 
@@ -584,13 +577,14 @@ class GraphitiAdapter(KnowledgeGraphAdapter):
             query = """
             MATCH (e1:Entity {uuid: $uuid})-[r]-(e2:Entity)
             RETURN r.uuid as uuid_, type(r) as name, r.fact as fact,
-                   r.fact_type as fact_type,
                    e1.uuid as source_node_uuid, e2.uuid as target_node_uuid,
                    e1.name as source_node_name, e2.name as target_node_name,
                    r.created_at as created_at
             """
             result = session.run(query, uuid=node_uuid)
             edges = [dict(record) for record in result]
+            for edge in edges:
+                edge["fact_type"] = edge.get("fact_type") or edge.get("name", "")
             return edges
 
     def get_edges(self, graph_id: str, limit: int = 100, cursor: str = None) -> List[Any]:
@@ -599,7 +593,6 @@ class GraphitiAdapter(KnowledgeGraphAdapter):
             query = """
             MATCH (e1:Entity {group_id: $group_id})-[r]-(e2:Entity {group_id: $group_id})
             RETURN r.uuid as uuid_, type(r) as name, r.fact as fact,
-                   r.fact_type as fact_type,
                    e1.uuid as source_node_uuid, e2.uuid as target_node_uuid,
                    e1.name as source_node_name, e2.name as target_node_name,
                    r.created_at as created_at, r.valid_at as valid_at,
@@ -614,6 +607,7 @@ class GraphitiAdapter(KnowledgeGraphAdapter):
                     edge['attributes'] = {}
                 if 'episodes' not in edge:
                     edge['episodes'] = []
+                edge['fact_type'] = edge.get('fact_type') or edge.get('name', '')
             return edges
 
     def delete(self, graph_id: str) -> bool:
